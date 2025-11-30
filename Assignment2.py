@@ -42,6 +42,8 @@ class DAMarketClearing():
         self._build_models() 
 
     def _build_models(self):
+        # Build one combined model that contains variables for all scenarios.
+        # This allows adding constraints that span scenarios (e.g. total demand across scenarios).
         self.scenario_models = {}
         self.all_results = {}
         # Initialize storage for per-scenario variables and constraints
@@ -52,13 +54,29 @@ class DAMarketClearing():
         self.constraints.demand_cap = {}
         self.constraints.mcc = {}
 
+        # single combined model
+        self.model = gp.Model(name='DA_Market_Clearing_AllScenarios')
+
+        # Accumulate objective terms for all scenarios
+        total_objective = 0
         for scenario in self.data.MARKETS:
-            self.model = gp.Model(name=f'DA_Market_Clearing_{scenario}')
             self._build_variables(scenario)
             self._build_constraints(scenario)
-            self._build_objective_function(scenario)
-            self.model.update()
-            self.scenario_models[scenario] = self.model
+            total_objective = total_objective + self._build_objective_function(scenario)
+
+        # Global constraint: total cleared demand across all scenarios equals 150
+        expr_all = gp.quicksum(
+            self.variables.demand_cleared[sc][d]
+            for sc in self.data.MARKETS
+            for d in list(self.data.demand_steps[sc].keys())
+        )
+        self.model.addConstr(expr_all == 150, name='Total_Demand_All_Scenarios')
+
+        # set combined objective and store model
+        self.model.setObjective(total_objective, GRB.MAXIMIZE)
+        self.model.update()
+        self.scenario_models['ALL'] = self.model
+    
     
     def _build_variables(self, scenario):
         # Production cleared from each supply step for this scenario (market)
@@ -67,7 +85,7 @@ class DAMarketClearing():
 
         self.variables.supply_cleared[scenario] = {
             s: self.model.addVar(lb=0, ub=GRB.INFINITY, name=f'Supply_Cleared_{s}_{scenario}') for s in supply_steps
-        }
+        } # 
 
         # Demand cleared for each demand step for this scenario
         self.variables.demand_cleared[scenario] = {
@@ -109,28 +127,25 @@ class DAMarketClearing():
             gp.quicksum(self.variables.demand_cleared[scenario][d] for d in demand_steps),
             name=f'Market_Clearing_Condition_{scenario}',
         )
+        # note: total-demand-per-scenario constraint is added separately by
+        # `_build_constraint_total_demand` which is called from the model builder.
 
     def _build_objective_function(self, scenario):
-            # Maximize Social Welfare = (Total Value of Cleared Demand) - (Total Cost of Cleared Supply)
-            supply_steps = list(self.data.generator_supply_steps[scenario].keys())
-            demand_steps = list(self.data.demand_steps[scenario].keys())
+        # Return objective expression for this scenario (so it can be accumulated across scenarios)
+        supply_steps = list(self.data.generator_supply_steps[scenario].keys())
+        demand_steps = list(self.data.demand_steps[scenario].keys())
 
-            # Total Value of Cleared Demand (WTP * Quantity)
-            total_demand_value = gp.quicksum(
-                self.data.demand_steps[scenario][d]['price'] * self.variables.demand_cleared[scenario][d]
-                for d in demand_steps
-            )
+        total_demand_value = gp.quicksum(
+            self.data.demand_steps[scenario][d]['price'] * self.variables.demand_cleared[scenario][d]
+            for d in demand_steps
+        )
 
-            # Total Cost of Cleared Supply (Cost * Quantity)
-            total_supply_cost = gp.quicksum(
-                self.data.generator_supply_steps[scenario][s]['cost'] * self.variables.supply_cleared[scenario][s]
-                for s in supply_steps
-            )
+        total_supply_cost = gp.quicksum(
+            self.data.generator_supply_steps[scenario][s]['cost'] * self.variables.supply_cleared[scenario][s]
+            for s in supply_steps
+        )
 
-            # Social Welfare
-            objective = total_demand_value - total_supply_cost
-
-            self.model.setObjective(objective, GRB.MAXIMIZE)
+        return total_demand_value - total_supply_cost
 
     def _save_results(self, scenario):
         # Extract variable values for the given scenario and store them
@@ -142,13 +157,17 @@ class DAMarketClearing():
         self.all_results[scenario] = res
 
     def run(self):
-        for scenario, model in self.scenario_models.items():
-            self.model = model # Set current model context
-            self.model.optimize()
-            if self.model.status == GRB.OPTIMAL:
+        # Optimize the single combined model and save results per scenario
+        model = self.scenario_models.get('ALL')
+        if model is None:
+            raise RuntimeError('No combined model found to run')
+        self.model = model
+        self.model.optimize()
+        if self.model.status == GRB.OPTIMAL:
+            for scenario in self.data.MARKETS:
                 self._save_results(scenario)
-            else:
-                raise RuntimeError(f"Optimization of {model.ModelName} was not successful. Status: {self.model.status}")
+        else:
+            raise RuntimeError(f"Optimization of {model.ModelName} was not successful. Status: {self.model.status}")
     
     def plot_results(self, generators=None, demands=None, mcps=None, q_eqs=None, scenarios=None):
         import matplotlib.pyplot as plt
