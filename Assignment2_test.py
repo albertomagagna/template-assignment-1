@@ -39,81 +39,85 @@ class DAMarketClearing():
         self._build_models() 
 
     def _build_models(self):
-        # Store per-scenario optimization results here
+        # Build a single combined model so we can add a global constraint across scenarios
         self.all_results = {}
+        self.variables.gen_supply = {}
+        self.variables.demand = {}
 
+        self.model = gp.Model('AllScenarios')
+        total_objective = 0
+
+        # create variables and per-scenario constraints, accumulate objective
         for scenario in self.data.MARKETS:
             self._build_variables(scenario)
             self._build_constraints(scenario)
-            self._build_constraint_total_demand()
-            self._build_objective_function(scenario)
+            total_objective = total_objective + self._build_objective_function(scenario)
 
-            # optimize the per-scenario model now and save results for plotting
-            self.model.optimize()
+        # Global constraint: sum of demand across all scenarios equals 80
+        expr_all = gp.quicksum(
+            self.variables.demand[sc][d]
+            for sc in self.data.MARKETS
+            for d in list(self.data.demand_steps[sc].keys())
+        )
+        self.model.addConstr(expr_all == 100, name='Total_Demand_All_Scenarios')
+
+        # set objective and optimize once
+        self.model.setObjective(total_objective, GRB.MAXIMIZE)
+        self.model.update()
+        self.model.optimize()
+
+        # extract per-scenario results for plotting
+        for scenario in self.data.MARKETS:
             if self.model.status == GRB.OPTIMAL:
                 res = {}
                 res['objective'] = self.model.objVal
-                # extract variable values for this scenario
-                res['gen_supply'] = {s: self.variables.gen_supply[s].X for s in self.variables.gen_supply.keys()}
-                res['demand'] = {d: self.variables.demand[d].X for d in self.variables.demand.keys()}
+                res['gen_supply'] = {s: self.variables.gen_supply[scenario][s].X for s in self.variables.gen_supply[scenario].keys()}
+                res['demand'] = {d: self.variables.demand[scenario][d].X for d in self.variables.demand[scenario].keys()}
             else:
                 res = {'objective': None, 'gen_supply': {}, 'demand': {}}
             self.all_results[scenario] = res
 
     def _build_variables(self, scenario):
-        model = gp.Model(scenario)
-
-        # Decision Variables
-        # Generator Supply Variables
+        # create variables in the combined model and store them per-scenario
         gen_supply_steps = self.data.generator_supply_steps[scenario]
-        self.variables.gen_supply = model.addVars(gen_supply_steps.keys(),name="gen_supply",lb=0,ub=gp.GRB.INFINITY,vtype=GRB.CONTINUOUS)
-
-        # Demand Variables
         demand_steps = self.data.demand_steps[scenario]
-        self.variables.demand = model.addVars(demand_steps.keys(),name="demand",lb=0,ub=gp.GRB.INFINITY,vtype=GRB.CONTINUOUS)
-        model.update()
-        self.model = model
+
+        self.variables.gen_supply[scenario] = self.model.addVars(gen_supply_steps.keys(), name=f"gen_supply_{scenario}", lb=0, ub=gp.GRB.INFINITY, vtype=GRB.CONTINUOUS)
+        self.variables.demand[scenario] = self.model.addVars(demand_steps.keys(), name=f"demand_{scenario}", lb=0, ub=gp.GRB.INFINITY, vtype=GRB.CONTINUOUS)
+        self.model.update()
         
     def _build_constraints(self, scenario):
         model = self.model
         gen_supply_steps = self.data.generator_supply_steps[scenario]
         demand_steps = self.data.demand_steps[scenario]
 
-        # Generator Supply Step Constraints
-        self.constraints.gen_supply_limits = model.addConstrs((self.variables.gen_supply[s] <= gen_supply_steps[s]['quantity'] for s in gen_supply_steps.keys()),name="gen_supply_limits")
+        # Generator Supply Step Constraints (per-scenario)
+        self.constraints.gen_supply_limits = model.addConstrs(
+            (self.variables.gen_supply[scenario][s] <= gen_supply_steps[s]['quantity'] for s in gen_supply_steps.keys()),
+            name=f"gen_supply_limits_{scenario}",
+        )
 
-        # Demand Step Constraints
-        self.constraints.demand_limits = model.addConstrs((self.variables.demand[d] <= demand_steps[d]['quantity'] for d in demand_steps.keys()),name="demand_limits")
-        model.update()
+        # Demand Step Constraints (per-scenario)
+        self.constraints.demand_limits = model.addConstrs(
+            (self.variables.demand[scenario][d] <= demand_steps[d]['quantity'] for d in demand_steps.keys()),
+            name=f"demand_limits_{scenario}",
+        )
 
-    def _build_constraint_total_demand(self):
-        model = self.model
-
-        # Total Demand equals Total Supply Constraint
-        # sum over the demand variables defined for the current model (per-scenario)
-        self.constraints.total_demand_supply = model.addConstr(
-            gp.quicksum(self.variables.demand[d] for d in self.variables.demand.keys()) == 80,
-            name="total_demand_supply",
+        self.constraints.market_clearing = model.addConstr(
+            gp.quicksum(self.variables.gen_supply[scenario][s] for s in gen_supply_steps.keys()) ==
+            gp.quicksum(self.variables.demand[scenario][d] for d in demand_steps.keys()),
+            name=f"market_clearing_{scenario}",
         )
         model.update()
-
         
     def _build_objective_function(self, scenario):
-        model = self.model
+        # Return objective expression for the given scenario so the caller can accumulate
         gen_supply_steps = self.data.generator_supply_steps[scenario]
         demand_steps = self.data.demand_steps[scenario]
 
-        # Objective Function: Maximize Social Welfare (Total Utility - Total Cost)
-        total_utility = gp.quicksum(demand_steps[d]['price'] * self.variables.demand[d] for d in demand_steps.keys())
-        total_cost = gp.quicksum(gen_supply_steps[s]['cost'] * self.variables.gen_supply[s] for s in gen_supply_steps.keys())
-        model.setObjective(total_utility - total_cost, GRB.MAXIMIZE)
-        model.update()
-
-    def _save_results(self):
-        # kept for compatibility but not used; per-scenario results are stored in self.all_results
-        pass
-
-
+        total_utility = gp.quicksum(demand_steps[d]['price'] * self.variables.demand[scenario][d] for d in demand_steps.keys())
+        total_cost = gp.quicksum(gen_supply_steps[s]['cost'] * self.variables.gen_supply[scenario][s] for s in gen_supply_steps.keys())
+        return total_utility - total_cost
 
     def run(self):
         # Print results collected while building models
@@ -214,8 +218,8 @@ if __name__ == '__main__':
 
     # Generator Bid: (x: 100, y: 10) -> Supply Step 1: 100 units at Cost 10
     DEMAND_OIL = {1: {'quantity': 100, 'price': 50}}
-    DEMAND_COAL = {1: {'quantity': 150, 'price': 40}}
-    DEMAND_GAS = {1: {'quantity': 200, 'price': 30}}
+    DEMAND_COAL = {1: {'quantity': 100, 'price': 50}}
+    DEMAND_GAS = {1: {'quantity': 100, 'price': 50}}
 
     DEMANDS = {
         'OIL': DEMAND_OIL,
@@ -225,18 +229,18 @@ if __name__ == '__main__':
 
     # Demand Bids: (x: 20, y: 60) and (x: 110, y: 40)
     GENERATOR_OIL = {
-        1: {'quantity': 20, 'cost': 60}, 
-        2: {'quantity': 90, 'cost': 40},
+        1: {'quantity': 20, 'cost': 45}, 
+        2: {'quantity': 40, 'cost': 40},
     }
     
     GENERATOR_COAL = {
-        1: {'quantity': 150, 'cost': 35},
-        2: {'quantity': 50, 'cost': 45},
+        1: {'quantity': 10, 'cost': 35},
+        2: {'quantity': 50, 'cost': 80},
     }
 
     GENERATOR_GAS = {
-        1: {'quantity': 200, 'cost': 25},
-        2: {'quantity': 100, 'cost': 35},
+        1: {'quantity': 40, 'cost': 25},
+        2: {'quantity': 50, 'cost': 100},
     }
    
     GENERATORS = {
